@@ -16,21 +16,22 @@ perftest.exe [Target] [Number of Populating Threads] [Number of Writing Threads]
 | Database Name                | Database name.                                      |
 | User Name                    | Username.                                           |
 | Password                     | Password.                                           |
+| Show Error                   | [0 | 1]                                             |
 
 ## Example:
 * Run a performance test against Couchbase Server using KV API, using 100 threads to populate 2M document into the bucket "poc", then using 100 update threads and 100 query threads to perform 20K operations concurrently. Login is pocAdmin and password is password.
 ```console
-.\perftest.exe cbkv 50 50 50 2000000 10000 cbs66sn poc pocAdmin password
+.\perftest.exe cbkv 50 50 50 2000000 10000 cbs66sn poc pocAdmin password 0
 ```
 
 * Run a performance test against Couchbase Server using Query API, using 100 threads to populate 2M document into the bucket "poc", then using 100 update threads and 100 query threads to perform 20K operations concurrently. Login is pocAdmin and password is password.
 ```console
-.\perftest.exe cbkv 50 50 50 2000000 10000 cbs66sn poc pocAdmin password
+.\perftest.exe cbkv 50 50 50 2000000 10000 cbs66sn poc pocAdmin password 0
 ```
 
 * Run a performance test against MSSQL, using 100 threads to populate 2M records the database "poc", then using 100 update threads and 100 query threads to perform 20K operations concurrently. Login is pocAdmin and password is password.
 ```console
-.\perftest.exe mssql 100 100 100 2000000 20000 mssqlsrv poc pocAdmin password
+.\perftest.exe mssql 100 100 100 2000000 20000 mssqlsrv poc pocAdmin password 0
 ```
 
 ## Provision
