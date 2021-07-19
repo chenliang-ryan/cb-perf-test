@@ -12,8 +12,6 @@ namespace Performance_Test
 {
     class MSSQLSrv
     {
-        private static Random rand = new Random();
-        private static Object randLock = new Object();
         private static string resetSQLText = "TRUNCATE TABLE Orders; TRUNCATE TABLE PerfStats;";
         private static string popSQLText = "INSERT INTO Orders (OrderID, [Name], Gender, Age, Outlet, Model, Color, UnitPrice, Quantity, TxTime, LastUpdate) " + 
                                         "   VALUES (@orderID, @name, @gender, @age, @outlet, @model, @color, @unitPrice, @quantity, getdate(), getdate()); ";
@@ -21,12 +19,14 @@ namespace Performance_Test
                                             " Orders.UnitPrice = @unitPrice, Orders.Quantity = @quantity, Orders.LastUpdate = getdate() " + 
                                             " WHERE OrderID = @orderID; ";
         private static string querySQLText = "SELECT * FROM Orders WHERE OrderID = @OrderID";
-        private static string statsSQLText = "INSERT INTO PerfStats (OpType, ResponseTime, LastUpdate) VALUES (@opType, @responseTime, sysdatetime());";
+        private static string statsSQLText = "INSERT INTO PerfStats (OrderID, OpType, ResponseTime, LastUpdate) VALUES (@OrderID, @opType, @responseTime, sysdatetime());";
+        private static string resultSQLText = "SELECT OpType, Avg(ResponseTime) AS AvgResponse, COUNT(ResponseTime) AS TotalOperations FROM PerfStats GROUP BY OpType";
         private int numberOfPopulatingThreads = 0;
         private int numberOfWritingThreads  = 0;
         private int numberOfReadingThreads  = 0;
         private int datasetSize = 0;
         private int numberOfOperations = 0;
+        private bool showError = false;
         private SqlConnectionStringBuilder sqlConnStrBuilder;
         private static SqlConnection sqlConn;
 
@@ -47,13 +47,17 @@ namespace Performance_Test
             sqlConnStrBuilder.MaxPoolSize = numberOfReadingThreads + numberOfWritingThreads + 10;
             sqlConnStrBuilder.MinPoolSize = numberOfReadingThreads + numberOfWritingThreads;
 
+            showError = showError = Int32.Parse(TestConfig["ShowError"]) == 0 ? false : true;
+
             sqlConn = new SqlConnection(sqlConnStrBuilder.ConnectionString);
             try{
                 sqlConn.Open();
             }
             catch (Exception e)
             {
-                Console.WriteLine(e.Message);
+                if (showError) Console.WriteLine("Exception was captured in initialization step. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
+                throw(new Exception("Unable to open connection to SQL Server"));
             }
         }
         
@@ -61,45 +65,104 @@ namespace Performance_Test
         {
             Stopwatch swMain = new Stopwatch();
             
-            Console.WriteLine("Reset database...");
             Reset();
 
-            Console.WriteLine("Start populating database...");
             swMain.Start();
 
-            Task[] populatingTasks = new Task[numberOfPopulatingThreads];
+            Thread[] populatingThreads = new Thread[numberOfPopulatingThreads];
             for (int n = 0; n < numberOfPopulatingThreads; n++) 
             {
                 int startNumber = n * datasetSize / numberOfPopulatingThreads + 1;
                 int endNumber = (n + 1) * datasetSize / numberOfPopulatingThreads;
                 endNumber = endNumber >= datasetSize ? datasetSize : endNumber;
-                populatingTasks[n] = Task.Factory.StartNew(()=>Populate(startNumber, endNumber));
+                populatingThreads[n] = new Thread(()=>Populate(startNumber, endNumber));
+                populatingThreads[n].Start();
             }
 
-            Task.WaitAll(populatingTasks);
+            bool populatingStatus = true;
+            while (populatingStatus)
+            {
+                int runningThread = 0;
+                Thread.Sleep(500);
+                for (int n = 0; n < numberOfPopulatingThreads; n++)
+                {
+                    runningThread += populatingThreads[n].IsAlive ? 1 : 0;
+                }
+
+                if (runningThread == 0) populatingStatus = false;
+            }
+
+            // Task[] populatingTasks = new Task[numberOfPopulatingThreads];
+            // for (int n = 0; n < numberOfPopulatingThreads; n++) 
+            // {
+            //     int startNumber = n * datasetSize / numberOfPopulatingThreads + 1;
+            //     int endNumber = (n + 1) * datasetSize / numberOfPopulatingThreads;
+            //     endNumber = endNumber >= datasetSize ? datasetSize : endNumber;
+            //     populatingTasks[n] = Task.Factory.StartNew(()=>Populate(startNumber, endNumber));
+            // }
+
+            // Task.WaitAll(populatingTasks);
             swMain.Stop();
-            Console.WriteLine("Test dataset was populated in {0:00}:{1:00}:{2:00}. Start testing...", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
+            Console.WriteLine("Test database was prepared in {0:00}:{1:00}:{2:00}.", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
 
             swMain.Reset();
-            Task[] testingTasks = new Task[numberOfReadingThreads + numberOfWritingThreads];
             swMain.Start();
+
+            Thread[] writingThreads = new Thread[numberOfWritingThreads];
+            Thread[] readingThreads = new Thread[numberOfReadingThreads];
             
+                           
             for (int n = 0; n < numberOfWritingThreads; n++) 
             {
-                int startNumber = n * datasetSize / numberOfWritingThreads + 1;
-                int endNumber = (n + 1) * datasetSize / numberOfWritingThreads;
-                endNumber = endNumber >= datasetSize ? datasetSize : endNumber;
-                testingTasks[n] = Task.Factory.StartNew(()=>Update(n, startNumber, endNumber));
-            }
-
-            for (int n = 0; n < numberOfReadingThreads; n++) 
-            {
-                testingTasks[numberOfWritingThreads + n] = Task.Factory.StartNew(()=>Get());
+                writingThreads[n] = new Thread(()=>Update());
+                writingThreads[n].Start();
             }
             
-            Task.WaitAll(testingTasks);
+            for (int n = 0; n < numberOfReadingThreads; n++) 
+            {
+                readingThreads[n] = new Thread(()=>Get());
+                readingThreads[n].Start();
+            }
+             
+            bool testingStatus = true;
+            while (testingStatus)
+            {
+                int runningThread = 0;
+                Thread.Sleep(1000);
+                for (int n = 0; n < numberOfWritingThreads; n++)
+                {
+                    runningThread += writingThreads[n].IsAlive ? 1 : 0;
+                }
+
+                for (int n = 0; n < numberOfReadingThreads; n++)
+                {
+                    runningThread += readingThreads[n].IsAlive ? 1 : 0;
+                }
+
+                if (runningThread == 0) testingStatus = false;
+            }
+
+            // Task[] testingTasks = new Task[numberOfReadingThreads + numberOfWritingThreads];
+
+            // for (int n = 0; n < numberOfWritingThreads; n++) 
+            // {
+            //     int startNumber = n * datasetSize / numberOfWritingThreads + 1;
+            //     int endNumber = (n + 1) * datasetSize / numberOfWritingThreads;
+            //     endNumber = endNumber >= datasetSize ? datasetSize : endNumber;
+            //     testingTasks[n] = Task.Factory.StartNew(()=>Update());
+            // }
+
+            // for (int n = 0; n < numberOfReadingThreads; n++) 
+            // {
+            //     testingTasks[numberOfWritingThreads + n] = Task.Factory.StartNew(()=>Get());
+            // }
+            
+            // Task.WaitAll(testingTasks);
             swMain.Stop();
-            Console.WriteLine("Testing was finished in {0:00}:{1:00}:{2:00}. Start testing...", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
+            Console.WriteLine("Testing was finished in {0:00}:{1:00}:{2:00}.", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
+
+            PrintResult();
+
             return;
         }
 
@@ -118,21 +181,32 @@ namespace Performance_Test
             }
             catch (Exception e)
             {
-                Console.WriteLine("Exception was captured in resetting step.");
-                Console.WriteLine(e.Message);
-                Console.WriteLine(e.StackTrace);
+                if (showError) Console.WriteLine("Exception was captured in resetting step. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
             }
         }
 
         private void Populate(int StartNumber, int EndNumber) 
         {
+            int retry = 0;
+
             try
             {
                 using (SqlConnection sqlConnPop = new SqlConnection(sqlConnStrBuilder.ConnectionString))
                 {
                     sqlConnPop.Open();
+
                     for(int n = StartNumber; n <= EndNumber; n++) 
                     {
+                        string randomName = Payload.GetName();
+                        string randomGender = Payload.GetGender();
+                        int randomAge = Payload.GetAge();
+                        string randomOutlet = Payload.GetOutlet();
+                        string randomModel = Payload.GetModel();
+                        string randomColor = Payload.GetColor();
+                        double randomUnitPrice = Payload.GetUnitPrice();
+                        int randomQuantity = Payload.GetQuantity();
+
                         try 
                         {
                             using (SqlCommand sqlCmdUpsert = new SqlCommand(popSQLText, sqlConnPop))
@@ -148,23 +222,23 @@ namespace Performance_Test
                                 sqlCmdUpsert.Parameters.Add("@quantity", SqlDbType.Int);
 
                                 sqlCmdUpsert.Parameters["@orderID"].Value = n;
-                                sqlCmdUpsert.Parameters["@name"].Value = Payload.GetName();
-                                sqlCmdUpsert.Parameters["@gender"].Value = Payload.GetGender();
-                                sqlCmdUpsert.Parameters["@age"].Value = Payload.GetAge();
-                                sqlCmdUpsert.Parameters["@outlet"].Value = Payload.GetOutlet();
-                                sqlCmdUpsert.Parameters["@model"].Value = Payload.GetModel();
-                                sqlCmdUpsert.Parameters["@color"].Value = Payload.GetColor();
-                                sqlCmdUpsert.Parameters["@unitPrice"].Value = Payload.GetUnitPrice();
-                                sqlCmdUpsert.Parameters["@quantity"].Value = Payload.GetQuantity();
+                                sqlCmdUpsert.Parameters["@name"].Value = randomName;
+                                sqlCmdUpsert.Parameters["@gender"].Value = randomGender;
+                                sqlCmdUpsert.Parameters["@age"].Value = randomAge;
+                                sqlCmdUpsert.Parameters["@outlet"].Value = randomOutlet;
+                                sqlCmdUpsert.Parameters["@model"].Value = randomModel;
+                                sqlCmdUpsert.Parameters["@color"].Value = randomColor;
+                                sqlCmdUpsert.Parameters["@unitPrice"].Value = randomUnitPrice;
+                                sqlCmdUpsert.Parameters["@quantity"].Value = randomQuantity;
 
                                 sqlCmdUpsert.ExecuteNonQuery();
                             }
                         }
                         catch (SqlException e) 
                         {
-                            Console.WriteLine("Exception was captured in populating step.");
-                            Console.WriteLine(e.Message);
-                            Console.WriteLine(e.StackTrace);
+                            if (showError) Console.WriteLine("Exception was captured in populating step. {0} {1}", n, e.Message);
+                            // Console.WriteLine(e.StackTrace);
+                            if (retry++ > 100) break;
                             continue;
                         }
                     }
@@ -172,18 +246,18 @@ namespace Performance_Test
             }
             catch (Exception e)
             {
-                Console.WriteLine("Exception was captured in dataset populating step.");
-                Console.WriteLine(e.Message);
-                Console.WriteLine(e.StackTrace);
+                if (showError) Console.WriteLine("Exception was captured in dataset populating step. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
             }
         }
 
-        private void Update(int ThreadNumber, int StartNumber, int EndNumber) 
+        private void Update() 
         {            
             Stopwatch sw = new Stopwatch();
             double latency = 0;
+            int retry = 0;
             int n = 0;
-
+    
             try
             {
                 using (SqlConnection sqlConnUpdate = new SqlConnection(sqlConnStrBuilder.ConnectionString))
@@ -191,6 +265,13 @@ namespace Performance_Test
                     sqlConnUpdate.Open();
                     while(n++ < numberOfOperations) 
                     {
+                        int randomOrderID = Payload.GetOrderID(1, datasetSize);
+                        string randomOutlet = Payload.GetOutlet();
+                        string randomModel = Payload.GetModel();
+                        string randomColor = Payload.GetColor();
+                        double randomUnitPrice = Payload.GetUnitPrice();
+                        int randomQuantity = Payload.GetQuantity();
+                                
                         try 
                         {
                             using (SqlCommand sqlCmdUpdate = new SqlCommand(updateSQLText, sqlConnUpdate))
@@ -202,27 +283,27 @@ namespace Performance_Test
                                 sqlCmdUpdate.Parameters.Add("@unitPrice", SqlDbType.Decimal);
                                 sqlCmdUpdate.Parameters.Add("@quantity", SqlDbType.Int);
 
-                                sqlCmdUpdate.Parameters["@orderID"].Value = Payload.GetOrderID(1, datasetSize + 1);
-                                sqlCmdUpdate.Parameters["@outlet"].Value = Payload.GetOutlet();
-                                sqlCmdUpdate.Parameters["@model"].Value = Payload.GetModel();
-                                sqlCmdUpdate.Parameters["@color"].Value = Payload.GetColor();
-                                sqlCmdUpdate.Parameters["@unitPrice"].Value = Payload.GetUnitPrice();
-                                sqlCmdUpdate.Parameters["@quantity"].Value = Payload.GetQuantity();
+                                sqlCmdUpdate.Parameters["@orderID"].Value = randomOrderID;
+                                sqlCmdUpdate.Parameters["@outlet"].Value = randomOutlet;
+                                sqlCmdUpdate.Parameters["@model"].Value = randomModel;
+                                sqlCmdUpdate.Parameters["@color"].Value = randomColor;
+                                sqlCmdUpdate.Parameters["@unitPrice"].Value = randomUnitPrice;
+                                sqlCmdUpdate.Parameters["@quantity"].Value = randomQuantity;
 
                                 sw.Start();   
                                 int result = sqlCmdUpdate.ExecuteNonQuery();
                                 sw.Stop();
-                                latency = sw.ElapsedMilliseconds;
+                                latency = sw.Elapsed.TotalMilliseconds;
                                 sw.Reset();
                                 if (result < 1) continue;
                             }
-                        
-                            // Console.WriteLine("Write response time: {0} ms", latency);
 
                             using (SqlCommand sqlCmdStats = new SqlCommand(statsSQLText, sqlConnUpdate)) {
+                                sqlCmdStats.Parameters.Add("@orderID", SqlDbType.Int);
                                 sqlCmdStats.Parameters.Add("@opType", SqlDbType.NVarChar);
                                 sqlCmdStats.Parameters.Add("@responseTime", SqlDbType.Float);
 
+                                sqlCmdStats.Parameters["@orderID"].Value = randomOrderID;
                                 sqlCmdStats.Parameters["@opType"].Value = "Update";
                                 sqlCmdStats.Parameters["@responseTime"].Value = latency;
 
@@ -231,9 +312,10 @@ namespace Performance_Test
                         }
                         catch (SqlException e) 
                         {
-                            Console.WriteLine("Exception was captured in writing tasks.");
-                            Console.WriteLine(e.Message);
-                            Console.WriteLine(e.StackTrace);
+                            Console.WriteLine("Exception was captured in writing tasks. {0} {1}", randomOrderID, e.Message);
+                            // Console.WriteLine(e.StackTrace);
+                            n--;
+                            if (retry++ > 100) break;
                             continue;
                         }
                     }
@@ -241,9 +323,8 @@ namespace Performance_Test
             }
             catch (Exception e)
             {
-                Console.WriteLine("Exception was captured in writing tasks.");
-                Console.WriteLine(e.Message);
-                Console.WriteLine(e.StackTrace);
+                if (showError) Console.WriteLine("Exception was captured in writing tasks. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
             }
         
         }
@@ -251,6 +332,7 @@ namespace Performance_Test
         private void Get() 
         {
             Stopwatch sw = new Stopwatch();
+            int retry = 0;
             double latency = 0;
             int n = 0;
             
@@ -261,32 +343,32 @@ namespace Performance_Test
                     sqlConnQuery.Open();
                     while(n++ < numberOfOperations) 
                     {
+                        int randomOrderID = Payload.GetOrderID(1, datasetSize);
                         try 
                         {
                             using (SqlCommand sqlCmdQuery = new SqlCommand(querySQLText, sqlConnQuery))
                             {
                                 sqlCmdQuery.Parameters.Add("@orderID", SqlDbType.Int);
                                 
-                                int orderID = Payload.GetOrderID(1, datasetSize);
-                                sqlCmdQuery.Parameters["@orderID"].Value = orderID;
+                                sqlCmdQuery.Parameters["@orderID"].Value = randomOrderID;
 
                                 sw.Start();
                                 using (SqlDataReader sqlReaderQuery = sqlCmdQuery.ExecuteReader()) 
                                 {
                                     sw.Stop();
-                                    latency = sw.ElapsedMilliseconds;
+                                    latency = sw.Elapsed.TotalMilliseconds;
                                     sw.Reset();
                                     if (! sqlReaderQuery.HasRows) continue;
                                 }
                             }
-                            
-                            // Console.WriteLine("Read response time: {0} ms", latency);
 
                             using (SqlCommand sqlCmdStats = new SqlCommand(statsSQLText, sqlConnQuery)) 
                             {
+                                sqlCmdStats.Parameters.Add("@orderID", SqlDbType.Int);
                                 sqlCmdStats.Parameters.Add("@opType", SqlDbType.NVarChar);
                                 sqlCmdStats.Parameters.Add("@responseTime", SqlDbType.Float);
 
+                                sqlCmdStats.Parameters["@orderID"].Value = randomOrderID;
                                 sqlCmdStats.Parameters["@opType"].Value = "Query";
                                 sqlCmdStats.Parameters["@responseTime"].Value = latency;
 
@@ -294,8 +376,10 @@ namespace Performance_Test
                             }
                         }
                         catch (SqlException e) {
-                            Console.WriteLine("Exception was captured in reading tasks.");
-                            Console.WriteLine(e.Message);
+                            if (showError) Console.WriteLine("Exception was captured in reading tasks. {0} {1}", randomOrderID, e.Message);
+                            // Console.WriteLine(e.StackTrace);
+                            n--;
+                            if (retry++ > 100) break;
                             continue;
                         }
                     }
@@ -303,9 +387,35 @@ namespace Performance_Test
             }
             catch (Exception e)
             {
-                Console.WriteLine("Exception was captured in reading tasks.");
-                Console.WriteLine(e.Message);
-                Console.WriteLine(e.StackTrace);
+                if (showError) Console.WriteLine("Exception was captured in reading tasks. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
+            }
+        }
+    
+        private void PrintResult()
+        {
+            try
+            {
+                using (SqlConnection sqlConnResult = new SqlConnection(sqlConnStrBuilder.ConnectionString))
+                {
+                    sqlConnResult.Open();
+                    using (SqlCommand sqlCmdResult = new SqlCommand(resultSQLText, sqlConnResult))
+                    {
+                        using (SqlDataReader sqlReaderResult = sqlCmdResult.ExecuteReader()) 
+                        {
+                            while (sqlReaderResult.Read())
+                            {
+                                Console.WriteLine("OpType: {0}, AvgResponseTime: {1}, TotalOperations: {2}", 
+                                                    sqlReaderResult[0], sqlReaderResult[1], sqlReaderResult[2]);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (showError) Console.WriteLine("Exception was captured in printing result. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
             }
         }
     }

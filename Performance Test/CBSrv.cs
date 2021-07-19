@@ -5,6 +5,7 @@ using System.Threading.Tasks;
 using System.Collections.Generic;
 using Couchbase;
 using Couchbase.KeyValue;
+using Couchbase.Query;
 
 namespace Performance_Test
 {
@@ -19,8 +20,10 @@ namespace Performance_Test
         private int numberOfReadingThreads  = 0;
         private int datasetSize = 0;
         private int numberOfOperations = 0;
+        private string insertSQLText = "";
         private string updateSQLText = "";
         private string querySQLText = "";
+        private bool showError = false;
 
         public CBSrv(Dictionary<string, string> TestConfig)
         {
@@ -35,19 +38,21 @@ namespace Performance_Test
             datasetSize = Int32.Parse(TestConfig["DatasetSize"]);
             numberOfOperations = Int32.Parse(TestConfig["NumberOfOperations"]);
             
-            updateSQLText = "UPDATE " + TestConfig["DatabaseName"] + " SET outlet = @outlet, model = @model, color = @color, " +
-                            " unitPrice = @unitPrice, quantity = @quantity, lastUpdate = @lastUpdate WHERE meta().id = @orderID";
-            querySQLText = "SELECT * FROM " + TestConfig["DatabaseName"] + " WHERE meta().id = @orderID";
+            showError = Int32.Parse(TestConfig["ShowError"]) == 0 ? false : true;
+            
+            insertSQLText = "INSERT INTO " + TestConfig["DatabaseName"] + " (KEY, VALUE) VALUES "
+                            + " ($docKey, $docValue)";
+            updateSQLText = "UPDATE " + TestConfig["DatabaseName"] + " USE KEYS $orderID SET outlet=$outlet, model=$model, color=$color, " +
+                            " unitPrice=$unitPrice, quantity=$quantity, lastUpdate=$lastUpdate";
+            querySQLText = "SELECT * FROM " + TestConfig["DatabaseName"] + " USE KEYS $orderID";
         }
 
         public void Start()
         {
             Stopwatch swMain = new Stopwatch();
             
-            Console.WriteLine("Reset database...");
             ResetDatabase();
 
-            Console.WriteLine("Start populating database...");
             swMain.Start();
 
             Thread[] populatingThreads = new Thread[numberOfPopulatingThreads];
@@ -56,17 +61,24 @@ namespace Performance_Test
                 int startNumber = n * datasetSize / numberOfPopulatingThreads + 1;
                 int endNumber = (n + 1) * datasetSize / numberOfPopulatingThreads;
                 endNumber = endNumber >= datasetSize ? datasetSize : endNumber;
-                populatingThreads[n] = new Thread(()=>KVPopulate(n, startNumber, endNumber));
-                populatingThreads[n].Start();
+                if (apiType.Equals("cbkv", StringComparison.OrdinalIgnoreCase)) 
+                {
+                    populatingThreads[n] = new Thread(()=>KVPopulate(startNumber, endNumber));
+                    populatingThreads[n].Start();
+                }
+                else if (apiType.Equals("cbquery", StringComparison.OrdinalIgnoreCase)) 
+                {
+                    populatingThreads[n] = new Thread(()=>QueryPopulate(startNumber, endNumber));
+                    populatingThreads[n].Start();
+                }
             }
 
-            Console.WriteLine("Waiting for populating");
             bool populatingStatus = true;
             while (populatingStatus)
             {
                 int runningThread = 0;
                 Thread.Sleep(500);
-                for (int n = 0; n < numberOfWritingThreads; n++)
+                for (int n = 0; n < numberOfPopulatingThreads; n++)
                 {
                     runningThread += populatingThreads[n].IsAlive ? 1 : 0;
                 }
@@ -75,42 +87,42 @@ namespace Performance_Test
             }
 
             swMain.Stop();
-            Console.WriteLine("Test dataset was populated in {0:00}:{1:00}:{2:00}. Start testing...", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
+            Console.WriteLine("Test bucket was prepared in {0:00}:{1:00}:{2:00}.", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
 
-            swMain.Reset();
-            
+            swMain.Reset();            
             swMain.Start();
+
             Thread[] writingThreads = new Thread[numberOfWritingThreads];
             Thread[] readingThreads = new Thread[numberOfReadingThreads];
 
-            if (apiType.Equals("cbkv", StringComparison.OrdinalIgnoreCase)) 
-            {                
-                for (int n = 0; n < numberOfWritingThreads; n++) 
+            for (int n = 0; n < numberOfWritingThreads; n++) 
+            {
+                if (apiType.Equals("cbkv", StringComparison.OrdinalIgnoreCase)) 
                 {
                     writingThreads[n] = new Thread(()=>KVUpdate());
                     writingThreads[n].Start();
                 }
-                
-                for (int n = 0; n < numberOfReadingThreads; n++) 
-                {
-                    readingThreads[n] = new Thread(()=>KVGet());
-                    readingThreads[n].Start();
-                }
-            } 
-            else if (apiType.Equals("cbquery", StringComparison.OrdinalIgnoreCase)) 
-            {
-                for (int n = 0; n < numberOfWritingThreads; n++) 
+                else if (apiType.Equals("cbquery", StringComparison.OrdinalIgnoreCase)) 
                 {
                     writingThreads[n] = new Thread(()=>QueryUpdate());
                     writingThreads[n].Start();
                 }
+            }
 
-                for (int n = 0; n < numberOfReadingThreads; n++) {
+            for (int n = 0; n < numberOfReadingThreads; n++) 
+            {
+                if (apiType.Equals("cbkv", StringComparison.OrdinalIgnoreCase))
+                {
+                    readingThreads[n] = new Thread(()=>KVGet());
+                    readingThreads[n].Start();
+                }
+                else if (apiType.Equals("cbquery", StringComparison.OrdinalIgnoreCase)) 
+                {
                     readingThreads[n] = new Thread(()=>QueryGet());
                     readingThreads[n].Start();
                 }
             }
-            
+
             bool testingStatus = true;
             while (testingStatus)
             {
@@ -131,6 +143,8 @@ namespace Performance_Test
 
             swMain.Stop();
             Console.WriteLine("Testing was finished in {0:00}:{1:00}:{2:00}.", swMain.Elapsed.Hours, swMain.Elapsed.Minutes, swMain.Elapsed.Seconds);
+
+            PrintResult().Wait();
             return;
         }
 
@@ -140,22 +154,22 @@ namespace Performance_Test
             {
                 Task taskFlush = cbCluster.Buckets.FlushBucketAsync(cbBucket.Name);
                 Task.WaitAll(taskFlush);
-                Console.WriteLine("Bucket {0} was flushed.", cbBucket.Name);
             }
             catch (Exception e)
             {
-                Console.WriteLine("Exception was captured in resetting step.");
-                Console.WriteLine(e.Message);
-                Console.WriteLine(e.StackTrace);
+                if (showError) Console.WriteLine("Exception was captured in resetting step. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
             }
         }
 
-        public void KVPopulate(int TaskNumber, int StartNumber, int EndNumber) 
+        private void KVPopulate(int StartNumber, int EndNumber) 
         {
+            int retry  = 0;
+
             for(int n = StartNumber; n <= EndNumber; n++)
             {
                 var tsString = DateTime.Now.ToString("s");
-                string orderID = "Order_" + n.ToString();
+                string randomOrderID = "Order_" + n.ToString();
                 string randomName = Payload.GetName();
                 string randomGender = Payload.GetGender();
                 int randomAge = Payload.GetAge();
@@ -170,25 +184,28 @@ namespace Performance_Test
                                     lastUpdate = tsString };
                 try
                 {
-                    var result = cbCollection.InsertAsync(orderID, document, options => {options.Timeout(TimeSpan.FromSeconds(60));}).Result;
+                    var result = cbCollection.InsertAsync(randomOrderID, document, options => {options.Timeout(TimeSpan.FromSeconds(60));}).Result;
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception was captured in populating task {0}.", TaskNumber);
-                    Console.WriteLine(e.Message);
-                    Console.WriteLine(e.StackTrace);
+                    if (showError) Console.WriteLine("Exception was captured in populating task {0}.", randomOrderID, e.Message);
+                    // Console.WriteLine(e.StackTrace);
+                    n--;
+                    if (retry++ > 100) break;
                     continue;
                 }
             }
         }
 
-        public void KVUpdate() {         
+        private void KVUpdate() 
+        {         
             Stopwatch sw = new Stopwatch();
+            int retry = 0;
 
             for(int n = 0; n < numberOfOperations; n++)
             {
                 string tsString = DateTime.Now.ToString("s");
-                string orderID = "Order_" + Payload.GetOrderID(1, datasetSize + 1).ToString();
+                string randomOrderID = "Order_" + Payload.GetOrderID(1, datasetSize).ToString();
                 string randomOutlet = Payload.GetOutlet();
                 string randomModel = Payload.GetModel();
                 string randomColor = Payload.GetColor();
@@ -198,7 +215,7 @@ namespace Performance_Test
                 sw.Start();
                 try
                 {
-                    var result = cbCollection.MutateInAsync(orderID, specs => {
+                    var result = cbCollection.MutateInAsync(randomOrderID, specs => {
                                                                 specs.Replace("outlet", randomOutlet);
                                                                 specs.Replace("model", randomModel);
                                                                 specs.Replace("color", randomColor);
@@ -208,120 +225,191 @@ namespace Performance_Test
                                                             }, 
                                                             options => {options.Timeout(TimeSpan.FromSeconds(5));}).Result;
                     sw.Stop();
-                    var latency = sw.ElapsedMilliseconds;
+                    var latency = sw.Elapsed.TotalMilliseconds;
                     sw.Reset();
 
                     string gID = Guid.NewGuid().ToString();
-                    var statsResult = cbCollection.UpsertAsync(gID, new { docType = "Stats", opType = "KVUpdate",  response = latency, lastUpdate = tsString}).Result;
+                    var statsDoc = new { docType = "Stats", opType = "KVUpdate",  response = latency, lastUpdate = tsString};
+                    var statsResult = cbCollection.InsertAsync(gID, statsDoc).Result;
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception was captured in writing tasks. OrderID {0}", orderID);
-                    Console.WriteLine(e.Message);
-                    Console.WriteLine(e.StackTrace);
+                    if (showError) Console.WriteLine("Exception was captured in writing tasks. {0} {1}", randomOrderID, e.Message);
+                    // Console.WriteLine(e.StackTrace);
+                    n--;
+                    if (retry++ > 100) break;
                     continue;
                 }
             }
         }
 
-        public void KVGet() {
+        private void KVGet() 
+        {
             Stopwatch sw = new Stopwatch();
+            int retry = 0;
             
             for(int n = 0; n < numberOfOperations; n++)
             {               
                 string tsString = DateTime.Now.ToString("s");
-                string orderID = "Order_" + Payload.GetOrderID(1, datasetSize + 1).ToString();
+                string randomOrderID = "Order_" + Payload.GetOrderID(1, datasetSize).ToString();
                 sw.Start();
                 try 
                 {    
-                    var result = cbCollection.GetAsync(orderID).Result;
+                    var result = cbCollection.GetAsync(randomOrderID).Result;
                     sw.Stop();
-                    var latency = sw.ElapsedMilliseconds;
+                    var latency = sw.Elapsed.TotalMilliseconds;
                     sw.Reset();
 
                     string gID = Guid.NewGuid().ToString();
-                    var statsResult = cbCollection.UpsertAsync(gID, new { docType = "Stats", opType = "KVGet",  response = latency, lastUpdate = tsString}).Result;
+                    var statsDoc = new { docType = "Stats", opType = "KVGet",  response = latency, lastUpdate = tsString};
+                    var statsResult = cbCollection.InsertAsync(gID, statsDoc).Result;
                 } 
                 catch (Exception e) {
-                    Console.WriteLine("Exception was captured in reading tasks.");
-                    Console.WriteLine(e.Message);
-                    Console.WriteLine(e.StackTrace);
+                    if (showError) Console.WriteLine("Exception was captured in reading tasks. {0} {1}", randomOrderID, e.Message);
+                    // Console.WriteLine(e.StackTrace);
+                    n--;
+                    if (retry++ > 100) break;
                     continue;
                 }
             }
         }
 
-        public void QueryUpdate() {
+        private void QueryPopulate(int StartNumber, int EndNumber) 
+        {
+            int retry  = 0;
+
+            for(int n = StartNumber; n <= EndNumber; n++)
+            {
+                var tsString = DateTime.Now.ToString("s");
+                string randomOrderID = "Order_" + n.ToString();
+                string randomName = Payload.GetName();
+                string randomGender = Payload.GetGender();
+                int randomAge = Payload.GetAge();
+                string randomOutlet = Payload.GetOutlet();
+                string randomModel = Payload.GetModel();
+                string randomColor = Payload.GetColor();
+                double randomUnitPrice = Payload.GetUnitPrice();
+                int randomQuantity = Payload.GetQuantity();
+                var document = new { docType = "Order", name = randomName, gender = randomGender, age = randomAge, 
+                                    outlet = randomOutlet, model = randomModel, color = randomColor, 
+                                    unitPrice = randomUnitPrice, quantity = randomQuantity, txTime = tsString, 
+                                    lastUpdate = tsString };
+                
+                try {
+                    var result = cbCluster.QueryAsync<dynamic>(insertSQLText, new QueryOptions()
+                                                                            .Parameter("docKey", randomOrderID)
+                                                                            .Parameter("docValue", document)
+                                                                            .AdHoc(false)).Result;
+                } 
+                catch (Exception e) 
+                {
+                    if (showError) Console.WriteLine("Exception was captured in populating tasks. {0} {1}", randomOrderID, e.Message);
+                    // Console.WriteLine(e.StackTrace);
+                    n--;
+                    if (retry++ > 100) break;
+                    continue;
+                }
+            }
+        }
+
+        private void QueryUpdate() 
+        {
             Stopwatch sw = new Stopwatch();
+            int retry = 0;
             
             for(int n = 0; n < numberOfOperations; n++)
             {
-                string orderID = "Order_" + Payload.GetOrderID(1, datasetSize + 1).ToString();
+                string randomOrderID = "Order_" + Payload.GetOrderID(1, datasetSize).ToString();
                 string randomOutlet = Payload.GetOutlet();
                 string randomModel = Payload.GetModel();
                 string randomColor = Payload.GetColor();
                 double randomUnitPrice = Payload.GetUnitPrice();
                 int randomQuantity = Payload.GetQuantity();
                 string tsString = DateTime.Now.ToString("s");
-
-                // var docValue = new { docType = "Order", name = Payload.GetName(), 
-                //                 gender = Payload.GetGender(), age = Payload.GetAge(), outlet = Payload.GetOutlet(), model = Payload.GetModel(),
-                //                 colors = Payload.GetColor(), unitPrice = Payload.GetUnitPrice(), quantity = Payload.GetQuantity(),
-                //                 txTime = tsString, lastUpdate = tsString };
-
+                
                 sw.Start();
                 try
                 {
-                    var result = cbCluster.QueryAsync<dynamic>(updateSQLText,
-                                                            options => options.Parameter("outlet", randomOutlet)
+                    var result = cbCluster.QueryAsync<dynamic>(updateSQLText, new QueryOptions()
+                                                                            .Parameter("outlet", randomOutlet)
                                                                             .Parameter("model", randomModel)
                                                                             .Parameter("color", randomColor)
                                                                             .Parameter("unitPrice", randomUnitPrice)
                                                                             .Parameter("quantity", randomQuantity)
                                                                             .Parameter("lastUpdate", tsString)
-                                                                            .Parameter("orderID", orderID)).Result;
+                                                                            .Parameter("orderID", randomOrderID)
+                                                                            .AdHoc(false)).Result;
                     sw.Stop();
-                    var latency = sw.ElapsedMilliseconds;
+                    var latency = sw.Elapsed.TotalMilliseconds;
                     sw.Reset();
 
                     string gID = Guid.NewGuid().ToString();
-                    var statsResult = cbCollection.UpsertAsync(gID, new { docType = "Stats", opType = "QueryUpdate",  response = latency, lastUpdate = tsString}).Result;
+                    var statsDoc = new { docType = "Stats", opType = "QueryUpdate",  response = latency, lastUpdate = tsString};
+                    var statsResult = cbCollection.InsertAsync(gID, statsDoc).Result;
                 }
                 catch (Exception e)
                 {
-                    Console.WriteLine("Exception was captured in writing tasks.");
-                    Console.WriteLine(e.Message);
-                    Console.WriteLine(e.StackTrace);
+                    if (showError) Console.WriteLine("Exception was captured in writing tasks: {0} {1}", randomOrderID, e.Message);
+                    // Console.WriteLine(e.StackTrace);
+                    n--;
+                    if (retry++ > 100) break;
                     continue;
                 }
             }
         }
 
-        public void QueryGet() {
+        public void QueryGet() 
+        {
             Stopwatch sw = new Stopwatch();
-            
+            int retry = 0;
+
             for(int n = 0; n < numberOfOperations; n++)
             {
-                string orderID = "Order_" + Payload.GetOrderID(1, datasetSize + 1).ToString();
+                string randomOrderID = "Order_" + Payload.GetOrderID(1, datasetSize).ToString();
                 var tsString = DateTime.Now.ToString("s");
+
                 sw.Start();
 
                 try {
-                    var result = cbCluster.QueryAsync<dynamic>(querySQLText, options => options.Parameter("orderID", orderID)).Result;
+                    var result = cbCluster.QueryAsync<dynamic>(querySQLText, new QueryOptions()
+                                                                                 .Parameter("orderID", randomOrderID)
+                                                                                 .AdHoc(false)
+                                                                                 .Readonly(true)).Result;
                     sw.Stop();
-                    var latency = sw.ElapsedMilliseconds;
+                    var latency = sw.Elapsed.TotalMilliseconds;
                     sw.Reset();
 
                     string gID = Guid.NewGuid().ToString();
-                    var statsResult = cbCollection.UpsertAsync(gID, new { docType = "Stats", opType = "QueryGet",  response = latency, lastUpdate = tsString}).Result;
+                    var statsDoc = new { docType = "Stats", opType = "QueryGet",  response = latency, lastUpdate = tsString};
+                    var statsResult = cbCollection.InsertAsync(gID, statsDoc).Result;
                 } 
                 catch (Exception e) 
                 {
-                    Console.WriteLine("Exception was captured in reading tasks.");
-                    Console.WriteLine(e.Message);
-                    Console.WriteLine(e.StackTrace);
+                    if (showError) Console.WriteLine("Exception was captured in reading tasks. {0} {1}", randomOrderID, e.Message);
+                    // Console.WriteLine(e.StackTrace);
+                    n--;
+                    if (retry++ > 100) break;
                     continue;
                 }
+            }
+        }
+    
+        private async Task PrintResult()
+        {
+            try
+            {
+                var result = await cbCluster.AnalyticsQueryAsync<dynamic>("SELECT opType, AVG(response) AS AvgResponse, COUNT(response) AS TotalOperations FROM PerfStats GROUP BY opType;");
+
+                await foreach (var row in result.Rows)
+                {
+                    Console.WriteLine("OpType: {0}, AvgResponseTime: {1}, TotalOperations: {2}", 
+                                        row.opType, row.AvgResponse, row.TotalOperations);
+                }
+            }
+            catch (Exception e)
+            {
+                if (showError) Console.WriteLine("Exception was captured in printing result. {0}", e.Message);
+                // Console.WriteLine(e.StackTrace);
             }
         }
     }
